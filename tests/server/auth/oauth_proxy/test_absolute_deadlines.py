@@ -1706,3 +1706,100 @@ async def test_a_transparent_refresh_ends_retention_at_an_authoritative_deadline
         assert await proxy._jti_mapping_store.get(key=access_jti) is not None
         assert await proxy.load_access_token(result.access_token) is None
     assert upstream.refresh_token.call_count == 1
+
+
+async def legacy_session(proxy: OAuthProxy, store: MemoryStore, t: float) -> str:
+    """An upstream record serialized before refresh-expiry provenance existed.
+
+    Written as a raw dict through the store, read back by the real model
+    adapter: it has a stored refresh expiry (t+600) but no provenance field.
+    Returns a FastMCP access token (3600 s) that references it.
+    """
+    await store.put(
+        "legacy-id",
+        {
+            "upstream_token_id": "legacy-id",
+            "access_token": "stale-upstream",
+            "refresh_token": "upstream-refresh",
+            "refresh_token_expires_at": t + 600,
+            "expires_at": t + 60,
+            "token_type": "Bearer",
+            "scope": "read",
+            "client_id": "test-client",
+            "created_at": t,
+            "raw_token_data": {},
+        },
+        collection="mcp-upstream-tokens",
+        ttl=3_600,
+    )
+    for jti in ("legacy-access", "legacy-refresh"):
+        await store.put(
+            jti,
+            {"jti": jti, "upstream_token_id": "legacy-id", "created_at": t},
+            collection="mcp-jti-mappings",
+            ttl=3_600,
+        )
+    loaded = await proxy._upstream_token_store.get(key="legacy-id")
+    assert loaded is not None
+    assert loaded.refresh_token_expires_at_authoritative  # unknown: a hard bound
+    return proxy.jwt_issuer.issue_access_token(
+        client_id="test-client", scopes=["read"], jti="legacy-access", expires_in=3_600
+    )
+
+
+async def test_a_legacy_record_bounds_retention_on_transparent_refresh(
+    verifier, store, monkeypatch
+):
+    proxy = make_proxy(verifier, store, **RETENTION_CONFIG)
+    clock = Clock(monkeypatch)
+    t = clock.start
+    upstream_rejects(verifier, {"stale-upstream"})
+    token = await legacy_session(proxy, store, t)
+
+    clock.offset = 61
+    validated = await transparently_refresh(
+        proxy, token, refreshed_upstream("refreshed-upstream", int(t) + 121)
+    )
+
+    assert validated is not None
+    retained = await entry_ends_at(store, "legacy-id", "mcp-upstream-tokens")
+    # Never past max(real access deadline, stored refresh deadline).
+    assert retained <= max(int(t) + 121, t + 600) + 0.5
+    assert retained == pytest.approx(t + 600, abs=1)
+
+
+async def test_a_legacy_record_bounds_retention_on_downstream_refresh(
+    verifier, store, monkeypatch
+):
+    proxy = make_proxy(verifier, store, **RETENTION_CONFIG)
+    client = await register(proxy)
+    clock = Clock(monkeypatch)
+    t = clock.start
+    await legacy_session(proxy, store, t)
+    refresh_token = proxy.jwt_issuer.issue_refresh_token(
+        client_id="test-client", scopes=["read"], jti="legacy-refresh", expires_in=600
+    )
+
+    clock.offset = 61
+    upstream = AsyncMock()
+    upstream.refresh_token = AsyncMock(
+        return_value=refreshed_upstream("refreshed-upstream", int(t) + 121)
+    )
+    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
+        refreshed = await proxy.exchange_refresh_token(
+            client=client,
+            refresh_token=RefreshToken(
+                token=refresh_token, client_id="test-client", scopes=["read"]
+            ),
+            scopes=["read"],
+        )
+
+    retained = await entry_ends_at(store, "legacy-id", "mcp-upstream-tokens")
+    assert retained <= max(int(t) + 121, t + 600) + 0.5
+    assert retained == pytest.approx(t + 600, abs=1)
+    # The rotated refresh token ends at the stored refresh deadline too.
+    assert refreshed.refresh_token is not None
+    rotated = proxy.jwt_issuer.verify_token(
+        refreshed.refresh_token, expected_token_use="refresh"
+    )
+    assert rotated["exp"] == math.floor(t + 600)

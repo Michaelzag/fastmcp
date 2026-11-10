@@ -1989,12 +1989,13 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         Any of them may carry the configured FastMCP lifetime from an issuance at
         or before `now`, so the record is kept that long, as before. A refresh
         deadline that is only a synthetic fallback must not shorten that. An
-        authoritative one does: past it and the access deadline the record can
-        no longer serve any token. 0 when nothing more needs keeping.
+        authoritative one does (a legacy record of unknown provenance counts as
+        authoritative): past it and the access deadline the record can no longer
+        serve any token. 0 when nothing more needs keeping.
         """
-        if (
-            upstream_token_set.refresh_token_expires_at_authoritative
-            or self._fastmcp_access_token_expiry_seconds is None
+        if self._fastmcp_access_token_expiry_seconds is None or (
+            upstream_token_set.refresh_token_expires_at is not None
+            and upstream_token_set.refresh_token_expires_at_authoritative
         ):
             return 0
         return now + self._fastmcp_access_token_expiry_seconds

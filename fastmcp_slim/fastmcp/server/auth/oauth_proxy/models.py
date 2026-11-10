@@ -107,11 +107,15 @@ class UpstreamTokenSet(BaseModel):
     # True when refresh_token_expires_at is upstream authority: a response's
     # refresh_token_expires_at, or an upstream refresh_expires_in anchored once
     # (at receipt, or at redemption for a code predating recorded deadlines).
-    # False for a locally synthesized fallback expiry or a record predating this
-    # field. A later response without a refresh expiry keeps both values. Only
-    # an authoritative deadline may end retention before outstanding FastMCP
+    # False only for a locally synthesized fallback expiry, which every writer
+    # sets explicitly. A record predating this field has unknown provenance and
+    # is conservatively read as True: its stored expiry is honoured as a hard
+    # bound (this is an interpretation, not reconstructed provenance), so a
+    # legacy record holding a synthetic fallback may need an earlier re-auth.
+    # A later response without a refresh expiry keeps both values. Only an
+    # authoritative deadline may end retention before outstanding FastMCP
     # access tokens that reference this record.
-    refresh_token_expires_at_authoritative: bool = False
+    refresh_token_expires_at_authoritative: bool = True
     token_type: str  # Usually "Bearer"
     scope: str  # Space-separated scopes
     client_id: str  # MCP client this is bound to
