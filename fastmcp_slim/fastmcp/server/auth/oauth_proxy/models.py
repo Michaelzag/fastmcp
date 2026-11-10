@@ -77,9 +77,10 @@ class ClientCode(BaseModel):
     idp_tokens: dict[str, Any]
     expires_at: float
     created_at: float
-    # Absolute upstream refresh deadline (Unix seconds), recorded when the
-    # callback received the token response; None when the IdP gave no refresh
-    # lifetime or the code predates this field (redemption stays relative).
+    # Absolute upstream deadlines (Unix seconds), normalized when the callback
+    # received the token response. None when the response gave none or the code
+    # predates these fields; redemption then keeps the relative fallback.
+    access_token_expires_at: float | None = None
     refresh_token_expires_at: float | None = None
 
 

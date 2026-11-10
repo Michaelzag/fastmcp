@@ -1,10 +1,13 @@
 """Absolute upstream deadlines are honoured at every use site, never re-based.
 
-authlib records ``expires_at`` (absolute) when a token response arrives. A
-redemption or refresh that happens later must end the FastMCP JWT, its JTI
-mapping and the stored upstream token at that deadline, not at
-``now + expires_in``. Responses without an absolute deadline keep the
-relative behaviour; a present but invalid one is refused.
+A token response carries absolute deadlines (`expires_at`, set by authlib on
+receipt or sent by the IdP, and an explicit `refresh_token_expires_at`) and
+relative lifetimes (`expires_in`, `refresh_expires_in`). Each deadline is the
+earlier of the absolute value and receipt + the relative one, snapshotted when
+the response arrives. A redemption or refresh that happens later ends the
+FastMCP JWT, its JTI mapping and the stored upstream token there, not at
+`now + expires_in`. Responses without an absolute access deadline keep the
+relative behaviour; a present but invalid value is refused.
 """
 
 import math
@@ -84,13 +87,30 @@ async def register(proxy: OAuthProxy) -> OAuthClientInformationFull:
     return client
 
 
+async def exchange(proxy: OAuthProxy, client: OAuthClientInformationFull, code: str):
+    return await proxy.exchange_authorization_code(
+        client=client,
+        authorization_code=AuthorizationCode(
+            code=code,
+            scopes=["read"],
+            expires_at=time.time() + 300,
+            client_id="test-client",
+            code_challenge="challenge",
+            redirect_uri=AnyUrl(REDIRECT),
+            redirect_uri_provided_explicitly=True,
+        ),
+    )
+
+
 async def redeem(
     proxy: OAuthProxy,
     client: OAuthClientInformationFull,
     idp_tokens: dict,
     *,
+    access_token_expires_at: float | None = None,
     refresh_token_expires_at: float | None = None,
 ):
+    """Redeem a code whose callback recorded the given deadlines."""
     await proxy._code_store.put(
         key="code",
         value=ClientCode(
@@ -103,21 +123,45 @@ async def redeem(
             idp_tokens=idp_tokens,
             expires_at=time.time() + 300,
             created_at=time.time(),
+            access_token_expires_at=access_token_expires_at,
             refresh_token_expires_at=refresh_token_expires_at,
         ),
     )
-    return await proxy.exchange_authorization_code(
-        client=client,
-        authorization_code=AuthorizationCode(
-            code="code",
-            scopes=["read"],
-            expires_at=time.time() + 300,
+    return await exchange(proxy, client, "code")
+
+
+async def callback(proxy: OAuthProxy, token_response: dict):
+    """Run the IdP callback with an upstream that answers `token_response`."""
+    await proxy._transaction_store.put(
+        key="txn-id",
+        value=OAuthTransaction(
+            txn_id="txn-id",
             client_id="test-client",
-            code_challenge="challenge",
-            redirect_uri=AnyUrl(REDIRECT),
-            redirect_uri_provided_explicitly=True,
+            client_redirect_uri=REDIRECT,
+            client_state="client-state",
+            code_challenge="",
+            code_challenge_method="S256",
+            scopes=["read"],
+            created_at=time.time(),
         ),
     )
+    request = Mock()
+    request.query_params = {"code": "idp-code", "state": "txn-id"}
+    request.cookies = {}
+    upstream = AsyncMock()
+    upstream.fetch_token = AsyncMock(return_value=token_response)
+    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
+        return await proxy._handle_idp_callback(request)
+
+
+async def recorded_code(proxy: OAuthProxy, token_response: dict):
+    """The callback's issued code and the ClientCode it stored."""
+    response = await callback(proxy, token_response)
+    assert response.status_code == 302
+    code = parse_qs(urlparse(response.headers["location"]).query)["code"][0]
+    stored = await proxy._code_store.get(key=code)
+    assert stored is not None
+    return code, stored
 
 
 async def entry_ends_at(store: MemoryStore, key: str, collection: str) -> float:
@@ -147,14 +191,20 @@ async def everything(store: MemoryStore) -> dict:
     }
 
 
+NOTHING_PUBLISHED = {
+    "mcp-upstream-tokens": [],
+    "mcp-jti-mappings": [],
+    "mcp-refresh-tokens": [],
+}
+
+
 async def published(store: MemoryStore) -> dict:
     """Every token record a redemption could publish."""
-    collections = ("mcp-upstream-tokens", "mcp-jti-mappings", "mcp-refresh-tokens")
-    return {name: await store.keys(name) for name in collections}
+    return {name: await store.keys(name) for name in NOTHING_PUBLISHED}
 
 
 # --------------------------------------------------------------------------
-# Helpers: presence, validity and floor
+# Helpers: normalization, validity and floor
 # --------------------------------------------------------------------------
 
 
@@ -162,26 +212,98 @@ async def published(store: MemoryStore) -> dict:
     ("token_data", "expected"),
     [
         ({"expires_at": 1_000}, 1_000),
-        ({"expires_at": 1_000.9}, 1_000),
-        ({"expires_at": None}, None),
+        ({"expires_at": 1_000.9}, 1_000.9),
+        ({"expires_at": None, "expires_in": 300}, None),
         ({"expires_in": 300}, None),
+        # Both present: the earlier wins, in either direction.
+        ({"expires_at": 1_000, "expires_in": 300}, 1_000),
+        ({"expires_at": 1_300, "expires_in": 300}, 1_200),
+        ({"expires_at": 1_300, "expires_in": "300"}, 1_200),
+        # A millisecond or far-future expires_at is bounded by the relative one.
+        ({"expires_at": 1_300_000, "expires_in": 300}, 1_200),
+        ({"expires_at": 10**12, "expires_in": 300}, 1_200),
     ],
 )
-def test_an_absolute_deadline_is_a_finite_number_or_absent(token_data, expected):
+def test_the_access_deadline_is_the_earlier_representation(token_data, expected):
     # Imported here so the behavioural tests below still collect without the fix.
-    from fastmcp.server.auth.oauth_proxy.proxy import _absolute_deadline
+    from fastmcp.server.auth.oauth_proxy.proxy import _access_deadline
 
-    assert _absolute_deadline(token_data) == expected
+    assert _access_deadline(token_data, received_at=900) == expected
+
+
+@pytest.mark.parametrize(
+    ("token_data", "expected"),
+    [
+        ({"refresh_token_expires_at": 2_000, "refresh_expires_in": 60}, None),
+        ({"refresh_token": "r"}, None),
+        ({"refresh_token": "r", "refresh_expires_in": 0}, None),
+        ({"refresh_token": "r", "refresh_expires_in": 3_600}, 3_700),
+        ({"refresh_token": "r", "refresh_token_expires_at": 2_000}, 2_000),
+        (
+            {
+                "refresh_token": "r",
+                "refresh_token_expires_at": 2_000,
+                "refresh_expires_in": 3_600,
+            },
+            2_000,
+        ),
+        (
+            {
+                "refresh_token": "r",
+                "refresh_token_expires_at": 9_000,
+                "refresh_expires_in": 3_600,
+            },
+            3_700,
+        ),
+    ],
+)
+def test_the_refresh_deadline_is_the_earlier_representation(token_data, expected):
+    from fastmcp.server.auth.oauth_proxy.proxy import _refresh_deadline
+
+    assert _refresh_deadline(token_data, received_at=100) == expected
 
 
 @pytest.mark.parametrize(
     "value", [True, False, "1000", "soon", math.nan, math.inf, -math.inf, [1_000]]
 )
-def test_a_present_but_invalid_deadline_fails_closed(value):
-    from fastmcp.server.auth.oauth_proxy.proxy import _absolute_deadline
+@pytest.mark.parametrize("field", ["expires_at", "refresh_token_expires_at"])
+def test_a_present_but_invalid_absolute_deadline_fails_closed(field, value):
+    from fastmcp.server.auth.oauth_proxy.proxy import (
+        _access_deadline,
+        _refresh_deadline,
+    )
 
+    token_data = {
+        "refresh_token": "r",
+        "expires_at": 2_000,
+        "expires_in": 300,
+        "refresh_expires_in": 3_600,
+        field: value,
+    }
+    deadline_of = _refresh_deadline if field.startswith("refresh") else _access_deadline
     with pytest.raises(TokenError) as refused:
-        _absolute_deadline({"expires_in": 300, "expires_at": value})
+        deadline_of(token_data, received_at=100)
+    assert refused.value.error == "invalid_grant"
+
+
+@pytest.mark.parametrize("value", [True, "soon", math.nan, math.inf, [300]])
+@pytest.mark.parametrize("field", ["expires_in", "refresh_expires_in"])
+def test_a_present_but_invalid_relative_lifetime_fails_closed(field, value):
+    from fastmcp.server.auth.oauth_proxy.proxy import (
+        _access_deadline,
+        _refresh_deadline,
+    )
+
+    token_data = {
+        "refresh_token": "r",
+        "expires_at": 2_000,
+        "expires_in": 300,
+        "refresh_expires_in": 3_600,
+        field: value,
+    }
+    deadline_of = _refresh_deadline if field.startswith("refresh") else _access_deadline
+    with pytest.raises(TokenError) as refused:
+        deadline_of(token_data, received_at=100)
     assert refused.value.error == "invalid_grant"
 
 
@@ -228,7 +350,9 @@ def test_a_client_code_stored_before_the_fix_still_loads():
         "expires_at": 1_000.0,
         "created_at": 700.0,
     }
-    assert ClientCode.model_validate(stored).refresh_token_expires_at is None
+    code = ClientCode.model_validate(stored)
+    assert code.access_token_expires_at is None
+    assert code.refresh_token_expires_at is None
 
 
 def test_the_issuer_signs_an_absolute_exp(proxy):
@@ -240,6 +364,113 @@ def test_the_issuer_signs_an_absolute_exp(proxy):
         expires_at=2_000_000_000,
     )
     assert proxy.jwt_issuer.verify_token(token)["exp"] == 2_000_000_000
+
+
+# --------------------------------------------------------------------------
+# The callback snapshots the deadlines on receipt
+# --------------------------------------------------------------------------
+
+
+async def test_the_callback_records_the_deadlines_on_receipt(proxy):
+    access_deadline = int(time.time()) + 100
+    before = time.time()
+    _, stored = await recorded_code(
+        proxy,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+            "expires_at": access_deadline,
+            "refresh_expires_in": 3_600,
+            "token_type": "Bearer",
+        },
+    )
+    after = time.time()
+
+    assert stored.access_token_expires_at == access_deadline
+    assert stored.refresh_token_expires_at is not None
+    assert before + 3_600 <= stored.refresh_token_expires_at <= after + 3_600
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [
+        pytest.param(lambda now: now + 600, id="later"),
+        pytest.param(lambda now: int(now * 1_000), id="milliseconds"),
+        pytest.param(lambda now: 10**12, id="far-future"),
+    ],
+)
+async def test_the_callback_bounds_the_access_deadline_by_receipt(proxy, expires_at):
+    before = time.time()
+    _, stored = await recorded_code(
+        proxy,
+        {
+            "access_token": "valid-upstream",
+            "expires_in": 300,
+            "expires_at": expires_at(before),
+            "token_type": "Bearer",
+        },
+    )
+    after = time.time()
+
+    assert stored.access_token_expires_at is not None
+    assert before + 300 <= stored.access_token_expires_at <= after + 300
+
+
+@pytest.mark.parametrize("absolute_first", [True, False])
+async def test_the_callback_records_the_earlier_refresh_deadline(proxy, absolute_first):
+    before = time.time()
+    absolute = before + (1_800 if absolute_first else 9_000)
+    _, stored = await recorded_code(
+        proxy,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+            "expires_at": int(before) + 300,
+            "refresh_token_expires_at": absolute,
+            "refresh_expires_in": 3_600,
+            "token_type": "Bearer",
+        },
+    )
+    after = time.time()
+
+    assert stored.refresh_token_expires_at is not None
+    if absolute_first:
+        assert stored.refresh_token_expires_at == absolute
+    else:
+        assert before + 3_600 <= stored.refresh_token_expires_at <= after + 3_600
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("expires_at", math.nan),
+        ("expires_at", math.inf),
+        ("expires_at", "soon"),
+        ("expires_at", True),
+        ("expires_in", "soon"),
+        ("refresh_token_expires_at", math.nan),
+        ("refresh_token_expires_at", "soon"),
+        ("refresh_token_expires_at", True),
+        ("refresh_expires_in", "soon"),
+    ],
+)
+async def test_the_callback_refuses_an_invalid_deadline(proxy, store, field, value):
+    response = await callback(
+        proxy,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+            "expires_at": int(time.time()) + 300,
+            "refresh_expires_in": 3_600,
+            "token_type": "Bearer",
+            field: value,
+        },
+    )
+    assert response.status_code == 500
+    assert await store.keys("mcp-authorization-codes") == []
 
 
 # --------------------------------------------------------------------------
@@ -263,6 +494,7 @@ async def test_a_delayed_redemption_ends_at_the_callback_deadlines(proxy, store)
             "refresh_expires_in": 3_600,
             "token_type": "Bearer",
         },
+        access_token_expires_at=access_deadline,
         refresh_token_expires_at=refresh_deadline,
     )
 
@@ -297,51 +529,72 @@ async def test_a_delayed_redemption_ends_at_the_callback_deadlines(proxy, store)
     assert metadata.expires_at == math.floor(refresh_deadline)
 
 
+async def test_a_malformed_expires_at_redeems_within_the_relative_lifetime(proxy):
+    client = await register(proxy)
+    before = time.time()
+    code, _ = await recorded_code(
+        proxy,
+        {
+            "access_token": "valid-upstream",
+            "expires_in": 300,
+            "expires_at": int(before * 1_000),
+            "token_type": "Bearer",
+        },
+    )
+    result = await exchange(proxy, client, code)
+
+    assert result.expires_in is not None
+    assert result.expires_in <= 300
+    assert proxy.jwt_issuer.verify_token(result.access_token)["exp"] <= before + 301
+
+
+async def test_a_refresh_only_absolute_deadline_is_honored_alone(proxy, store):
+    client = await register(proxy)
+    refresh_deadline = time.time() + 1_800.5
+    code, stored = await recorded_code(
+        proxy,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+            "refresh_token_expires_at": refresh_deadline,
+            "token_type": "Bearer",
+        },
+    )
+    assert stored.access_token_expires_at is None
+    assert stored.refresh_token_expires_at == refresh_deadline
+
+    result = await exchange(proxy, client, code)
+    # No absolute access deadline: the relative access path is unchanged.
+    access = proxy.jwt_issuer.verify_token(result.access_token)
+    assert result.expires_in == 300
+    assert access["exp"] - access["iat"] == 300
+    assert result.refresh_token is not None
+    refresh = proxy.jwt_issuer.verify_token(
+        result.refresh_token, expected_token_use="refresh"
+    )
+    assert refresh["exp"] == math.floor(refresh_deadline)
+    assert await entry_ends_at(
+        store, refresh["jti"], "mcp-jti-mappings"
+    ) == pytest.approx(refresh_deadline, abs=0.5)
+    metadata = await proxy._refresh_token_store.get(
+        key=_hash_token(result.refresh_token)
+    )
+    assert metadata is not None
+    assert metadata.expires_at == math.floor(refresh_deadline)
+
+
 async def test_redeeming_after_the_access_deadline_is_refused(proxy, store):
     client = await register(proxy)
     with pytest.raises(TokenError) as refused:
         await redeem(
             proxy,
             client,
-            {
-                "access_token": "valid-upstream",
-                "expires_in": 300,
-                "expires_at": int(time.time()) - 1,
-                "token_type": "Bearer",
-            },
+            {"access_token": "valid-upstream", "expires_in": 300},
+            access_token_expires_at=int(time.time()) - 1,
         )
     assert refused.value.error == "invalid_grant"
-    assert await published(store) == {
-        "mcp-upstream-tokens": [],
-        "mcp-jti-mappings": [],
-        "mcp-refresh-tokens": [],
-    }
-
-
-# NaN and infinity do not survive the ClientCode storage round trip (they
-# become null); the callback refuses them on receipt instead (tested below).
-@pytest.mark.parametrize("value", [True, "1000"])
-async def test_redeeming_with_an_invalid_access_deadline_is_refused(
-    proxy, store, value
-):
-    client = await register(proxy)
-    with pytest.raises(TokenError) as refused:
-        await redeem(
-            proxy,
-            client,
-            {
-                "access_token": "valid-upstream",
-                "expires_in": 300,
-                "expires_at": value,
-                "token_type": "Bearer",
-            },
-        )
-    assert refused.value.error == "invalid_grant"
-    assert await published(store) == {
-        "mcp-upstream-tokens": [],
-        "mcp-jti-mappings": [],
-        "mcp-refresh-tokens": [],
-    }
+    assert await published(store) == NOTHING_PUBLISHED
 
 
 async def test_redeeming_after_the_refresh_deadline_is_refused(proxy, store):
@@ -354,18 +607,12 @@ async def test_redeeming_after_the_refresh_deadline_is_refused(proxy, store):
                 "access_token": "valid-upstream",
                 "refresh_token": "upstream-refresh",
                 "expires_in": 300,
-                "expires_at": int(time.time()) + 300,
                 "refresh_expires_in": 3_600,
-                "token_type": "Bearer",
             },
             refresh_token_expires_at=time.time() - 1,
         )
     assert refused.value.error == "invalid_grant"
-    assert await published(store) == {
-        "mcp-upstream-tokens": [],
-        "mcp-jti-mappings": [],
-        "mcp-refresh-tokens": [],
-    }
+    assert await published(store) == NOTHING_PUBLISHED
 
 
 @pytest.mark.parametrize(
@@ -378,22 +625,17 @@ async def test_redemption_at_a_fractional_boundary(
     client = await register(proxy)
     deadline = 2_000_000_000
     monkeypatch.setattr(time, "time", lambda: deadline - seconds_before_deadline)
-    tokens = {
-        "access_token": "valid-upstream",
-        "expires_in": 300,
-        "expires_at": deadline,
-        "token_type": "Bearer",
-    }
+    tokens = {"access_token": "valid-upstream", "expires_in": 300}
     if not accepted:
         with pytest.raises(TokenError):
-            await redeem(proxy, client, tokens)
+            await redeem(proxy, client, tokens, access_token_expires_at=deadline)
         return
-    result = await redeem(proxy, client, tokens)
+    result = await redeem(proxy, client, tokens, access_token_expires_at=deadline)
     assert result.expires_in == 1
     assert proxy.jwt_issuer.verify_token(result.access_token)["exp"] == deadline
 
 
-async def test_without_an_absolute_deadline_redemption_is_unchanged(proxy):
+async def test_without_recorded_deadlines_redemption_is_unchanged(proxy):
     client = await register(proxy)
     result = await redeem(
         proxy,
@@ -402,10 +644,12 @@ async def test_without_an_absolute_deadline_redemption_is_unchanged(proxy):
             "access_token": "valid-upstream",
             "refresh_token": "upstream-refresh",
             "expires_in": 300,
+            "expires_at": int(time.time()) + 100,
             "refresh_expires_in": 3_600,
             "token_type": "Bearer",
         },
     )
+    # A legacy code: the raw response is not re-read at redemption.
     access = proxy.jwt_issuer.verify_token(result.access_token)
     assert result.expires_in == 300
     assert access["exp"] - access["iat"] == 300
@@ -414,72 +658,6 @@ async def test_without_an_absolute_deadline_redemption_is_unchanged(proxy):
         result.refresh_token, expected_token_use="refresh"
     )
     assert refresh["exp"] - refresh["iat"] == 3_600
-
-
-# --------------------------------------------------------------------------
-# The callback records the absolute refresh deadline
-# --------------------------------------------------------------------------
-
-
-async def callback(proxy: OAuthProxy, token_response: dict):
-    await proxy._transaction_store.put(
-        key="txn-id",
-        value=OAuthTransaction(
-            txn_id="txn-id",
-            client_id="test-client",
-            client_redirect_uri=REDIRECT,
-            client_state="client-state",
-            code_challenge="",
-            code_challenge_method="S256",
-            scopes=["read"],
-            created_at=time.time(),
-        ),
-    )
-    request = Mock()
-    request.query_params = {"code": "idp-code", "state": "txn-id"}
-    request.cookies = {}
-    upstream = AsyncMock()
-    upstream.fetch_token = AsyncMock(return_value=token_response)
-    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
-        return await proxy._handle_idp_callback(request)
-
-
-async def test_the_callback_records_an_absolute_refresh_deadline(proxy):
-    before = time.time()
-    response = await callback(
-        proxy,
-        {
-            "access_token": "valid-upstream",
-            "refresh_token": "upstream-refresh",
-            "expires_in": 300,
-            "expires_at": int(time.time()) + 300,
-            "refresh_expires_in": 3_600,
-            "token_type": "Bearer",
-        },
-    )
-    after = time.time()
-
-    assert response.status_code == 302
-    code = parse_qs(urlparse(response.headers["location"]).query)["code"][0]
-    stored = await proxy._code_store.get(key=code)
-    assert stored is not None
-    assert stored.refresh_token_expires_at is not None
-    assert before + 3_600 <= stored.refresh_token_expires_at <= after + 3_600
-
-
-@pytest.mark.parametrize("value", [math.nan, math.inf, "soon", True])
-async def test_the_callback_refuses_an_invalid_access_deadline(proxy, store, value):
-    response = await callback(
-        proxy,
-        {
-            "access_token": "valid-upstream",
-            "expires_in": 300,
-            "expires_at": value,
-            "token_type": "Bearer",
-        },
-    )
-    assert response.status_code == 500
-    assert await store.keys("mcp-authorization-codes") == []
 
 
 # --------------------------------------------------------------------------
@@ -496,26 +674,34 @@ async def signed_in(proxy: OAuthProxy, *, refresh_deadline: float | None = None)
             "access_token": "valid-upstream",
             "refresh_token": "upstream-refresh",
             "expires_in": 300,
-            "expires_at": int(time.time()) + 300,
             "refresh_expires_in": 3_600,
             "token_type": "Bearer",
         },
+        access_token_expires_at=int(time.time()) + 300,
         refresh_token_expires_at=refresh_deadline or time.time() + 3_600,
     )
     return client, result
 
 
-def refresh_response(expires_at: object, *, rotate: bool = True) -> dict:
+def refresh_response(
+    expires_at: object = None,
+    *,
+    rotate: bool = True,
+    refresh_token_expires_at: object = None,
+) -> dict:
     response: dict = {
         "access_token": "refreshed-upstream",
         "token_type": "Bearer",
         "expires_in": 300,
-        "expires_at": expires_at,
         "scope": "read",
     }
+    if expires_at is not None:
+        response["expires_at"] = expires_at
     if rotate:
         response["refresh_token"] = "upstream-refresh-2"
         response["refresh_expires_in"] = 3_600
+    if refresh_token_expires_at is not None:
+        response["refresh_token_expires_at"] = refresh_token_expires_at
     return response
 
 
@@ -563,6 +749,43 @@ async def test_a_downstream_refresh_ends_at_the_response_deadline(proxy, store):
     assert metadata.expires_at == math.floor(refresh_deadline)
 
 
+async def test_a_downstream_refresh_bounds_a_malformed_expires_at(proxy):
+    client, result = await signed_in(proxy)
+    before = time.time()
+    response = refresh_response(int(before * 1_000))
+    refreshed = await refresh(proxy, client, result, response)
+
+    _, token_set = await stored_set(proxy, refreshed.access_token)
+    assert before + 300 <= token_set.expires_at <= time.time() + 300
+    exp = proxy.jwt_issuer.verify_token(refreshed.access_token)["exp"]
+    assert exp == math.floor(token_set.expires_at)
+
+
+@pytest.mark.parametrize("absolute_first", [True, False])
+async def test_a_downstream_refresh_takes_the_earlier_refresh_deadline(
+    proxy, absolute_first
+):
+    client, result = await signed_in(proxy)
+    before = time.time()
+    absolute = int(before) + (1_800 if absolute_first else 9_000)
+    response = refresh_response(int(before) + 300, refresh_token_expires_at=absolute)
+    refreshed = await refresh(proxy, client, result, response)
+    after = time.time()
+
+    _, token_set = await stored_set(proxy, refreshed.access_token)
+    deadline = token_set.refresh_token_expires_at
+    assert deadline is not None
+    if absolute_first:
+        assert deadline == absolute
+    else:
+        assert before + 3_600 <= deadline <= after + 3_600
+    assert refreshed.refresh_token is not None
+    rotated = proxy.jwt_issuer.verify_token(
+        refreshed.refresh_token, expected_token_use="refresh"
+    )
+    assert rotated["exp"] == math.floor(deadline)
+
+
 async def test_a_downstream_refresh_keeps_the_recorded_refresh_deadline(proxy):
     refresh_deadline = time.time() + 1_800.5
     client, result = await signed_in(proxy, refresh_deadline=refresh_deadline)
@@ -571,6 +794,7 @@ async def test_a_downstream_refresh_keeps_the_recorded_refresh_deadline(proxy):
         proxy, client, result, refresh_response(deadline, rotate=False)
     )
 
+    assert refreshed.refresh_token is not None
     rotated = proxy.jwt_issuer.verify_token(
         refreshed.refresh_token, expected_token_use="refresh"
     )
@@ -579,35 +803,55 @@ async def test_a_downstream_refresh_keeps_the_recorded_refresh_deadline(proxy):
     assert token_set.refresh_token_expires_at == refresh_deadline
 
 
-@pytest.mark.parametrize("expires_at", ["past", True, math.nan, "1000"])
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param(lambda: refresh_response(int(time.time()) - 1), id="past"),
+        pytest.param(lambda: refresh_response(True), id="bool"),
+        pytest.param(lambda: refresh_response(math.nan), id="nan"),
+        pytest.param(lambda: refresh_response("1000"), id="string"),
+        pytest.param(
+            lambda: refresh_response(
+                int(time.time()) + 300, refresh_token_expires_at="soon"
+            ),
+            id="refresh-string",
+        ),
+        pytest.param(
+            lambda: refresh_response(
+                int(time.time()) + 300, refresh_token_expires_at=time.time() - 1
+            ),
+            id="refresh-past",
+        ),
+    ],
+)
 async def test_a_downstream_refresh_with_a_bad_deadline_publishes_nothing(
-    proxy, store, expires_at
+    proxy, store, response
 ):
     client, result = await signed_in(proxy)
     before = await everything(store)
-    if expires_at == "past":
-        expires_at = int(time.time()) - 1
     with pytest.raises(TokenError) as refused:
-        await refresh(proxy, client, result, refresh_response(expires_at))
+        await refresh(proxy, client, result, response())
     assert refused.value.error == "invalid_grant"
     assert await everything(store) == before
 
 
+@pytest.mark.parametrize("access_absolute", [True, False])
 async def test_a_downstream_refresh_past_the_recorded_refresh_deadline_is_refused(
-    proxy, store
+    proxy, store, access_absolute
 ):
     client, result = await signed_in(proxy)
     # The upstream still answers, but the refresh deadline recorded for this
-    # session has passed: no refresh token with a fabricated lifetime is issued.
+    # session has passed: no refresh token with a fabricated lifetime is issued,
+    # whether or not the response carries an absolute access deadline.
     _, token_set = await stored_set(proxy, result.access_token)
     token_set.refresh_token_expires_at = time.time() - 1
     await proxy._upstream_token_store.put(
         key=token_set.upstream_token_id, value=token_set, ttl=3_600
     )
     before = await everything(store)
-    response = refresh_response(int(time.time()) + 300, rotate=False)
+    expires_at = int(time.time()) + 300 if access_absolute else None
     with pytest.raises(TokenError) as refused:
-        await refresh(proxy, client, result, response)
+        await refresh(proxy, client, result, refresh_response(expires_at, rotate=False))
     assert refused.value.error == "invalid_grant"
     assert await everything(store) == before
 
@@ -645,17 +889,21 @@ async def expired_session(proxy: OAuthProxy) -> str:
     )
 
 
+async def transparently_refresh(proxy: OAuthProxy, token: str, response: dict):
+    upstream = AsyncMock()
+    upstream.refresh_token = AsyncMock(return_value=response)
+    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
+        return await proxy.load_access_token(token)
+
+
 async def test_a_transparent_refresh_ends_at_the_response_deadline(proxy, store):
     token = await expired_session(proxy)
     before = await proxy._upstream_token_store.get(key="upstream-id")
     assert before is not None
     deadline = int(time.time()) + 300 - DELAY
-    upstream = AsyncMock()
-    upstream.refresh_token = AsyncMock(
-        return_value=refresh_response(deadline, rotate=False)
+    validated = await transparently_refresh(
+        proxy, token, refresh_response(deadline, rotate=False)
     )
-    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
-        validated = await proxy.load_access_token(token)
 
     # A plain OAuthProxy returns the verifier's AccessToken unchanged; only an
     # alternate-verification provider (OIDCProxy with verify_id_token) copies
@@ -671,6 +919,20 @@ async def test_a_transparent_refresh_ends_at_the_response_deadline(proxy, store)
     ) == pytest.approx(before.refresh_token_expires_at, abs=1)
 
 
+async def test_a_transparent_refresh_bounds_a_malformed_expires_at(proxy):
+    token = await expired_session(proxy)
+    before = time.time()
+    validated = await transparently_refresh(
+        proxy, token, refresh_response(10**12, refresh_token_expires_at=before + 900)
+    )
+
+    assert validated is not None
+    token_set = await proxy._upstream_token_store.get(key="upstream-id")
+    assert token_set is not None
+    assert before + 300 <= token_set.expires_at <= time.time() + 300
+    assert token_set.refresh_token_expires_at == before + 900
+
+
 @pytest.mark.parametrize("expires_at", ["past", True, math.inf])
 async def test_a_transparent_refresh_with_a_bad_deadline_stores_nothing(
     proxy, expires_at
@@ -679,8 +941,7 @@ async def test_a_transparent_refresh_with_a_bad_deadline_stores_nothing(
     before = await proxy._upstream_token_store.get(key="upstream-id")
     if expires_at == "past":
         expires_at = int(time.time()) - 1
-    upstream = AsyncMock()
-    upstream.refresh_token = AsyncMock(return_value=refresh_response(expires_at))
-    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
-        assert await proxy.load_access_token(token) is None
+    assert (
+        await transparently_refresh(proxy, token, refresh_response(expires_at)) is None
+    )
     assert await proxy._upstream_token_store.get(key="upstream-id") == before
