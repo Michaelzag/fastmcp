@@ -109,6 +109,7 @@ class JWTIssuer:
         jti: str,
         expires_in: int = 3600,
         upstream_claims: dict[str, Any] | None = None,
+        expires_at: int | None = None,
     ) -> str:
         """Issue a minimal FastMCP access token.
 
@@ -122,6 +123,8 @@ class JWTIssuer:
             jti: Unique token identifier (maps to upstream token)
             expires_in: Token lifetime in seconds
             upstream_claims: Optional claims from upstream IdP token to include
+            expires_at: Absolute `exp` (Unix seconds) to sign instead of
+                now + expires_in
 
         Returns:
             Signed JWT token
@@ -134,7 +137,7 @@ class JWTIssuer:
             "aud": self.audience,
             "client_id": client_id,
             "scope": " ".join(scopes),
-            "exp": now + expires_in,
+            "exp": expires_at if expires_at is not None else now + expires_in,
             "iat": now,
             "jti": jti,
         }
@@ -165,6 +168,7 @@ class JWTIssuer:
         jti: str,
         expires_in: int,
         upstream_claims: dict[str, Any] | None = None,
+        expires_at: int | None = None,
     ) -> str:
         """Issue a minimal FastMCP refresh token.
 
@@ -178,6 +182,8 @@ class JWTIssuer:
             jti: Unique token identifier (maps to upstream token)
             expires_in: Token lifetime in seconds (should match upstream refresh expiry)
             upstream_claims: Optional claims from upstream IdP token to include
+            expires_at: Absolute `exp` (Unix seconds) to sign instead of
+                now + expires_in
 
         Returns:
             Signed JWT token
@@ -190,7 +196,7 @@ class JWTIssuer:
             "aud": self.audience,
             "client_id": client_id,
             "scope": " ".join(scopes),
-            "exp": now + expires_in,
+            "exp": expires_at if expires_at is not None else now + expires_in,
             "iat": now,
             "jti": jti,
             "token_use": "refresh",
