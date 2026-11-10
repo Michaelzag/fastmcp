@@ -444,27 +444,35 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 defaults: 1 hour if a refresh token is available (since we can refresh),
                 or 1 year if no refresh token (for API-key-style tokens like GitHub OAuth Apps).
                 Set explicitly to override these defaults.
-            fallback_refresh_token_expiry_seconds: Expiry time to use when upstream provider
-                doesn't return `refresh_expires_in` (e.g. Cognito, GitHub, many OIDC IdPs).
-                Defaults to 1 year. Note: this only controls the FastMCP-issued refresh token
-                lifetime — the actual upstream refresh remains the source of truth. If the
-                upstream rejects the refresh, the client gets `invalid_grant` and re-auths,
+            fallback_refresh_token_expiry_seconds: Maximum FastMCP refresh token lifetime
+                to use when upstream provider doesn't return `refresh_expires_in` (e.g.
+                Cognito, GitHub, many OIDC IdPs). Defaults to 1 year. It never outlives a
+                known absolute upstream refresh deadline (`refresh_token_expires_at`),
+                which bounds the FastMCP refresh JWT, its JTI mapping and metadata.
+                Note: this only controls the FastMCP-issued refresh token lifetime — the
+                actual upstream refresh remains the source of truth. If the upstream
+                rejects the refresh, the client gets `invalid_grant` and re-auths,
                 regardless of how much life is left on the FastMCP refresh token.
-            fastmcp_access_token_expiry_seconds: Lifetime for the FastMCP-issued access
-                token (JWT), decoupling it from the upstream provider's `expires_in`. By
-                default (None) the FastMCP access token mirrors the upstream access token
-                lifetime. The FastMCP JWT is a reference token — `load_access_token`
-                re-validates the upstream token on every request and transparently refreshes
-                it when expired — so issuing a longer-lived FastMCP token does not extend
-                upstream access: a revoked or expired upstream session still fails validation
-                and forces re-auth. Set this for bridges whose upstream issues short-lived
-                access tokens (5-60 min) that some MCP clients can't refresh gracefully
-                (e.g. `mcp-remote`), where the short client-facing TTL forces a full re-auth
-                on every idle period. Only affects the FastMCP-issued token; the upstream
-                token's real expiry is preserved internally to drive transparent refresh.
-                When the upstream provider issues no refresh token there is no way to renew
-                the access token, so the lifetime is capped at the upstream `expires_in`
-                regardless of this value (it can still be used to shorten it).
+            fastmcp_access_token_expiry_seconds: Maximum lifetime for the FastMCP-issued
+                access token (JWT), decoupling it from the upstream provider's
+                `expires_in`. By default (None) the FastMCP access token mirrors the
+                upstream access token lifetime. The FastMCP JWT is a reference token —
+                `load_access_token` re-validates the upstream token on every request and
+                transparently refreshes it when expired — so issuing a longer-lived
+                FastMCP token does not extend upstream access: a revoked or expired
+                upstream session still fails validation and forces re-auth. Set this for
+                bridges whose upstream issues short-lived access tokens (5-60 min) that
+                some MCP clients can't refresh gracefully (e.g. `mcp-remote`), where the
+                short client-facing TTL forces a full re-auth on every idle period. Only
+                affects the FastMCP-issued token; the upstream token's real expiry is
+                preserved internally to drive transparent refresh. When the upstream
+                token response carries an absolute access deadline (`expires_at`, which
+                authlib sets on receipt from `expires_in`), the FastMCP token, its JTI
+                mapping and the response's `expires_in` end at the earlier of that
+                deadline and issuance plus this value; a longer value has no effect
+                then. When the upstream provider issues no refresh token there is no
+                way to renew the access token, so the lifetime is likewise capped at the
+                upstream `expires_in` (this value can still be used to shorten it).
             token_expiry_threshold_seconds: Number of seconds before actual expiry to consider
                 a token as expired (default 0). This prevents race conditions where a token
                 passes the expiry check but expires before the next operation completes.
@@ -1233,8 +1241,11 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         # - User-provided fallback if set
         # - 1 hour if refresh token available (can refresh when expired)
         # - 1 year if no refresh token (likely API-key-style token like GitHub OAuth Apps)
-        if "expires_in" in idp_tokens:
-            expires_in = int(idp_tokens["expires_in"])
+        # A null expires_in is absent, as at the callback.
+        if (
+            upstream_expires_in := _relative_field(idp_tokens, "expires_in")
+        ) is not None:
+            expires_in = upstream_expires_in
             logger.debug(
                 "Access token TTL: %d seconds (from IdP expires_in)", expires_in
             )
@@ -1257,12 +1268,17 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         # An absolute deadline is never outlived. The one normalized at the
         # callback is used as-is: a delayed redemption must not re-base
         # expires_in on now. A code stored before deadlines were recorded is
-        # bounded by its response's own expires_at.
+        # bounded by its response's own expires_at and by the relative lifetime
+        # counted from the code's created_at. created_at is set after the token
+        # fetch, when the code is created, so it approximates (and is no earlier
+        # than) the actual receipt.
         access_deadline = code_model.access_token_expires_at
         if access_deadline is None:
             legacy_deadline = _absolute_field(idp_tokens, "expires_at")
             if legacy_deadline is not None:
-                access_deadline = min(legacy_deadline, now + expires_in)
+                access_deadline = min(
+                    legacy_deadline, code_model.created_at + expires_in
+                )
         if access_deadline is not None:
             expires_in = _seconds_until(access_deadline, now)
             if expires_in <= 0:
@@ -1278,20 +1294,28 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         # response's expires_in. Extending past the upstream lifetime is only safe
         # when we can refresh: without an upstream refresh token there is no way to
         # renew the access token, so the FastMCP token must not claim to outlive the
-        # upstream token it points at. Nor may it outlive an absolute upstream
-        # deadline.
+        # upstream token it points at.
         fastmcp_access_expires_in = expires_in
         if self._fastmcp_access_token_expiry_seconds is not None:
             fastmcp_access_expires_in = self._fastmcp_access_token_expiry_seconds
-            if not idp_tokens.get("refresh_token") or access_deadline is not None:
+            if not idp_tokens.get("refresh_token"):
                 fastmcp_access_expires_in = min(fastmcp_access_expires_in, expires_in)
-        # When the FastMCP token follows the upstream one, its signed exp is the
-        # upstream's absolute deadline (whole seconds, never later).
-        fastmcp_access_expires_at = (
-            math.floor(access_deadline)
-            if access_deadline is not None and fastmcp_access_expires_in == expires_in
-            else None
-        )
+        # With an absolute upstream deadline the FastMCP token gets a fixed local
+        # absolute expiry: the upstream deadline, or this calculation time plus a
+        # configured lifetime (a maximum) when that ends first. The signed exp and
+        # every TTL derive from it at write time; the clock is never restarted
+        # after the async work below.
+        fastmcp_access_expires_at = None
+        if access_deadline is not None:
+            local_end = access_deadline
+            if self._fastmcp_access_token_expiry_seconds is not None:
+                local_end = min(
+                    local_end, now + self._fastmcp_access_token_expiry_seconds
+                )
+            fastmcp_access_expires_at = math.floor(local_end)
+            fastmcp_access_expires_in = _seconds_until(fastmcp_access_expires_at, now)
+            if fastmcp_access_expires_in <= 0:
+                raise TokenError("invalid_grant", "Upstream access token has expired")
 
         # Calculate refresh token expiry if provided by upstream
         # Some providers include refresh_expires_in, some don't
@@ -1299,10 +1323,8 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         refresh_token_expires_at = None
         refresh_deadline = None
         if idp_tokens.get("refresh_token"):
-            if "refresh_expires_in" in idp_tokens and int(
-                idp_tokens["refresh_expires_in"]
-            ):
-                refresh_expires_in = int(idp_tokens["refresh_expires_in"])
+            if refresh_lifetime := _relative_field(idp_tokens, "refresh_expires_in"):
+                refresh_expires_in = refresh_lifetime
                 refresh_token_expires_at = time.time() + refresh_expires_in
                 logger.debug(
                     "Upstream refresh token expires in %d seconds", refresh_expires_in
@@ -1321,14 +1343,17 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
 
             # As for the access token: the deadline recorded at the callback, or
             # for an older code its response's own refresh_token_expires_at,
-            # bounds the relative or fallback lifetime above.
+            # bounds the relative or fallback lifetime above (counted from the
+            # code's created_at, an approximation of receipt).
             refresh_deadline = code_model.refresh_token_expires_at
             if refresh_deadline is None:
                 legacy_deadline = _absolute_field(
                     idp_tokens, "refresh_token_expires_at"
                 )
                 if legacy_deadline is not None:
-                    refresh_deadline = min(legacy_deadline, now + refresh_expires_in)
+                    refresh_deadline = min(
+                        legacy_deadline, code_model.created_at + refresh_expires_in
+                    )
             if refresh_deadline is not None:
                 refresh_token_expires_at = refresh_deadline
                 refresh_expires_in = _seconds_until(refresh_deadline, now)
@@ -1467,11 +1492,16 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             refresh_jti[:8] if refresh_jti else "none",
         )
 
-        # Return FastMCP-issued tokens (NOT upstream tokens!)
+        # Return FastMCP-issued tokens (NOT upstream tokens!). With a fixed local
+        # expiry, expires_in counts down to it from now, never restarted.
         return OAuthToken(
             access_token=fastmcp_access_token,
             token_type="Bearer",
-            expires_in=fastmcp_access_expires_in,
+            expires_in=(
+                fastmcp_access_expires_in
+                if fastmcp_access_expires_at is None
+                else _seconds_until(fastmcp_access_expires_at, time.time())
+            ),
             refresh_token=fastmcp_refresh_token,
             scope=" ".join(granted_scopes),
         )
@@ -1682,8 +1712,11 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 "Refreshed access token TTL: %d seconds (until absolute deadline)",
                 new_expires_in,
             )
-        elif "expires_in" in token_response:
-            new_expires_in = int(token_response["expires_in"])
+        elif (
+            upstream_expires_in := _relative_field(token_response, "expires_in")
+        ) is not None:
+            # A null expires_in is absent, as at the callback.
+            new_expires_in = upstream_expires_in
             logger.debug(
                 "Refreshed access token TTL: %d seconds (from IdP expires_in)",
                 new_expires_in,
@@ -1707,24 +1740,25 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         )
 
         # See exchange_authorization_code: the FastMCP access token may outlive the
-        # upstream one, but never an absolute upstream deadline. `new_expires_in`
-        # stays the upstream lifetime (drives upstream_token_set.expires_at and
-        # transparent refresh).
+        # upstream one, but never an absolute upstream deadline; it then gets the
+        # same fixed local absolute expiry. `new_expires_in` stays the upstream
+        # lifetime (drives upstream_token_set.expires_at and transparent refresh).
         fastmcp_access_expires_in = (
             self._fastmcp_access_token_expiry_seconds
             if self._fastmcp_access_token_expiry_seconds is not None
             else new_expires_in
         )
+        fastmcp_access_expires_at = None
         if access_deadline is not None:
-            fastmcp_access_expires_in = min(fastmcp_access_expires_in, new_expires_in)
-        # When the FastMCP token follows the upstream one, its signed exp is the
-        # upstream's absolute deadline (whole seconds, never later).
-        fastmcp_access_expires_at = (
-            math.floor(access_deadline)
-            if access_deadline is not None
-            and fastmcp_access_expires_in == new_expires_in
-            else None
-        )
+            local_end = access_deadline
+            if self._fastmcp_access_token_expiry_seconds is not None:
+                local_end = min(
+                    local_end, now + self._fastmcp_access_token_expiry_seconds
+                )
+            fastmcp_access_expires_at = math.floor(local_end)
+            fastmcp_access_expires_in = _seconds_until(fastmcp_access_expires_at, now)
+            if fastmcp_access_expires_in <= 0:
+                raise TokenError("invalid_grant", "Upstream access token has expired")
 
         # Prefer IdP-granted scopes from refresh response (RFC 6749 §5.1)
         refreshed_scopes: list[str] = (
@@ -1897,7 +1931,11 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         return OAuthToken(
             access_token=new_fastmcp_access,
             token_type="Bearer",
-            expires_in=fastmcp_access_expires_in,
+            expires_in=(
+                fastmcp_access_expires_in
+                if fastmcp_access_expires_at is None
+                else _seconds_until(fastmcp_access_expires_at, time.time())
+            ),
             refresh_token=new_fastmcp_refresh,  # NEW refresh token (rotated)
             scope=" ".join(refreshed_scopes),
         )
@@ -1969,8 +2007,10 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             new_expires_in = _seconds_until(access_deadline, now)
             if new_expires_in <= 0:
                 raise TokenError("invalid_grant", "Upstream access token has expired")
-        elif "expires_in" in token_response:
-            new_expires_in = int(token_response["expires_in"])
+        elif (
+            upstream_expires_in := _relative_field(token_response, "expires_in")
+        ) is not None:
+            new_expires_in = upstream_expires_in
         elif self._fallback_access_token_expiry_seconds is not None:
             new_expires_in = self._fallback_access_token_expiry_seconds
         else:

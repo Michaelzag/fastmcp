@@ -76,10 +76,15 @@ class ClientCode(BaseModel):
     scopes: list[str]
     idp_tokens: dict[str, Any]
     expires_at: float
+    # When the code was created, after the upstream token fetch; not the exact
+    # token receipt time.
     created_at: float
     # Absolute upstream deadlines (Unix seconds), normalized when the callback
     # received the token response. None when the response gave none or the code
-    # predates these fields; redemption then keeps the relative fallback.
+    # predates these fields. For a code predating them, redemption still honours
+    # an absolute deadline in idp_tokens (bounded by the relative lifetime counted
+    # from created_at); only with no absolute deadline anywhere does it keep the
+    # relative fallback.
     access_token_expires_at: float | None = None
     refresh_token_expires_at: float | None = None
 
