@@ -1322,10 +1322,14 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         refresh_expires_in = None
         refresh_token_expires_at = None
         refresh_deadline = None
+        # Whether the refresh expiry is upstream authority (an absolute deadline
+        # or an upstream refresh_expires_in) rather than the local fallback.
+        refresh_authoritative = False
         if idp_tokens.get("refresh_token"):
             if refresh_lifetime := _relative_field(idp_tokens, "refresh_expires_in"):
                 refresh_expires_in = refresh_lifetime
                 refresh_token_expires_at = time.time() + refresh_expires_in
+                refresh_authoritative = True
                 logger.debug(
                     "Upstream refresh token expires in %d seconds", refresh_expires_in
                 )
@@ -1375,6 +1379,9 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
             if idp_tokens.get("refresh_token")
             else None,
             refresh_token_expires_at=refresh_token_expires_at,
+            refresh_token_expires_at_authoritative=(
+                refresh_authoritative or refresh_deadline is not None
+            ),
             expires_at=(
                 access_deadline
                 if access_deadline is not None
@@ -1784,6 +1791,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 response_deadline := _refresh_deadline(token_response, now)
             ) is not None:
                 upstream_token_set.refresh_token_expires_at = response_deadline
+                upstream_token_set.refresh_token_expires_at_authoritative = True
                 logger.debug(
                     "Upstream refresh token expires in %d seconds",
                     _seconds_until(response_deadline, now),
@@ -1793,6 +1801,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 upstream_token_set.refresh_token_expires_at = (
                     now + self._fallback_refresh_token_expiry_seconds
                 )
+                upstream_token_set.refresh_token_expires_at_authoritative = False
             # Otherwise keep the existing expiry
 
         upstream_token_set.raw_token_data = {
@@ -1822,6 +1831,7 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                         access_deadline or now + new_expires_in,
                         fastmcp_access_expires_at or now + fastmcp_access_expires_in,
                         refresh_deadline or now + refresh_ttl,
+                        self._outstanding_access_retention(upstream_token_set, now),
                     )
                 )
             ),
@@ -1971,6 +1981,24 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         """
         return False
 
+    def _outstanding_access_retention(
+        self, upstream_token_set: UpstreamTokenSet, now: float
+    ) -> float:
+        """Until when FastMCP access tokens issued earlier may reference the record.
+
+        Any of them may carry the configured FastMCP lifetime from an issuance at
+        or before `now`, so the record is kept that long, as before. A refresh
+        deadline that is only a synthetic fallback must not shorten that. An
+        authoritative one does: past it and the access deadline the record can
+        no longer serve any token. 0 when nothing more needs keeping.
+        """
+        if (
+            upstream_token_set.refresh_token_expires_at_authoritative
+            or self._fastmcp_access_token_expiry_seconds is None
+        ):
+            return 0
+        return now + self._fastmcp_access_token_expiry_seconds
+
     async def _try_transparent_refresh(
         self,
         upstream_token_set: UpstreamTokenSet,
@@ -2039,10 +2067,12 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                 response_deadline := _refresh_deadline(token_response, now)
             ) is not None:
                 upstream_token_set.refresh_token_expires_at = response_deadline
+                upstream_token_set.refresh_token_expires_at_authoritative = True
             elif not upstream_token_set.refresh_token_expires_at:
                 upstream_token_set.refresh_token_expires_at = (
                     now + self._fallback_refresh_token_expiry_seconds
                 )
+                upstream_token_set.refresh_token_expires_at_authoritative = False
 
         upstream_token_set.raw_token_data = {
             **upstream_token_set.raw_token_data,
@@ -2053,10 +2083,9 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
         await self._upstream_token_store.put(
             key=upstream_token_set.upstream_token_id,
             value=upstream_token_set,
-            # Include the configured FastMCP lifetime so the upstream token never
-            # expires before an extended access JTI mapping that still points at it.
-            # With an absolute access deadline no FastMCP access token outlives it,
-            # so the configured lifetime does not extend the stored credential.
+            # Keep the record while an outstanding access JTI mapping may still
+            # point at it (the configured FastMCP lifetime), unless an
+            # authoritative refresh deadline ends its usefulness first.
             ttl=(
                 max(
                     self._fallback_refresh_token_expiry_seconds,
@@ -2065,17 +2094,13 @@ class OAuthProxy(OAuthProvider, ConsentMixin):
                     1,
                 )
                 if access_deadline is None and refresh_deadline is None
-                else max(
-                    _ttl_until(
-                        max(
-                            access_deadline or now + new_expires_in,
-                            refresh_deadline
-                            or now + self._fallback_refresh_token_expiry_seconds,
-                        )
-                    ),
-                    0
-                    if access_deadline is not None
-                    else self._fastmcp_access_token_expiry_seconds or 0,
+                else _ttl_until(
+                    max(
+                        access_deadline or now + new_expires_in,
+                        refresh_deadline
+                        or now + self._fallback_refresh_token_expiry_seconds,
+                        self._outstanding_access_retention(upstream_token_set, now),
+                    )
                 )
             ),
         )

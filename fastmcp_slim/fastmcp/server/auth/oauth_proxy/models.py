@@ -104,6 +104,14 @@ class UpstreamTokenSet(BaseModel):
         float | None
     )  # Unix timestamp when refresh token expires (if known)
     expires_at: float  # Unix timestamp when access token expires
+    # True when refresh_token_expires_at is upstream authority: a response's
+    # refresh_token_expires_at, or an upstream refresh_expires_in anchored once
+    # (at receipt, or at redemption for a code predating recorded deadlines).
+    # False for a locally synthesized fallback expiry or a record predating this
+    # field. A later response without a refresh expiry keeps both values. Only
+    # an authoritative deadline may end retention before outstanding FastMCP
+    # access tokens that reference this record.
+    refresh_token_expires_at_authoritative: bool = False
     token_type: str  # Usually "Bearer"
     scope: str  # Space-separated scopes
     client_id: str  # MCP client this is bound to
