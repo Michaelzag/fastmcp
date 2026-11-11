@@ -12,10 +12,12 @@ relative behaviour; a present but invalid value is refused.
 
 import math
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from key_value.aio._utils import managed_entry, time_to_live
 from key_value.aio.stores.memory import MemoryStore
 from mcp.server.auth.provider import (
     AccessToken,
@@ -60,8 +62,7 @@ def store() -> MemoryStore:
     return MemoryStore()
 
 
-@pytest.fixture
-def proxy(verifier, store) -> OAuthProxy:
+def make_proxy(verifier, store, **config) -> OAuthProxy:
     proxy = OAuthProxy(
         upstream_authorization_endpoint="https://idp.example.com/authorize",
         upstream_token_endpoint="https://idp.example.com/token",
@@ -72,9 +73,30 @@ def proxy(verifier, store) -> OAuthProxy:
         jwt_signing_key="test-secret-key",
         require_authorization_consent=False,
         client_storage=store,
+        **config,
     )
     proxy.set_mcp_path("/mcp")
     return proxy
+
+
+@pytest.fixture
+def proxy(verifier, store) -> OAuthProxy:
+    return make_proxy(verifier, store)
+
+
+CONFIGURED_ACCESS = 3_600
+CONFIGURED_REFRESH_FALLBACK = 86_400
+
+
+@pytest.fixture
+def configured(verifier, store) -> OAuthProxy:
+    """A proxy with a configured FastMCP access lifetime and refresh fallback."""
+    return make_proxy(
+        verifier,
+        store,
+        fastmcp_access_token_expiry_seconds=CONFIGURED_ACCESS,
+        fallback_refresh_token_expiry_seconds=CONFIGURED_REFRESH_FALLBACK,
+    )
 
 
 async def register(proxy: OAuthProxy) -> OAuthClientInformationFull:
@@ -109,6 +131,7 @@ async def redeem(
     *,
     access_token_expires_at: float | None = None,
     refresh_token_expires_at: float | None = None,
+    created_at: float | None = None,
 ):
     """Redeem a code whose callback recorded the given deadlines."""
     await proxy._code_store.put(
@@ -122,7 +145,7 @@ async def redeem(
             scopes=["read"],
             idp_tokens=idp_tokens,
             expires_at=time.time() + 300,
-            created_at=time.time(),
+            created_at=time.time() if created_at is None else created_at,
             access_token_expires_at=access_token_expires_at,
             refresh_token_expires_at=refresh_token_expires_at,
         ),
@@ -635,7 +658,222 @@ async def test_redemption_at_a_fractional_boundary(
     assert proxy.jwt_issuer.verify_token(result.access_token)["exp"] == deadline
 
 
-async def test_without_recorded_deadlines_redemption_is_unchanged(proxy):
+async def test_a_legacy_code_is_bounded_by_its_response_expires_at(proxy, store):
+    client = await register(proxy)
+    deadline = int(time.time()) + 100
+    # A code stored before deadlines were recorded: no ClientCode fields.
+    result = await redeem(
+        proxy,
+        client,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+            "expires_at": deadline,
+            "refresh_expires_in": 3_600,
+            "token_type": "Bearer",
+        },
+    )
+    access = proxy.jwt_issuer.verify_token(result.access_token)
+    assert result.expires_in is not None
+    assert result.expires_in <= 100
+    assert access["exp"] == deadline
+    access_jti, token_set = await stored_set(proxy, result.access_token)
+    assert token_set.expires_at == deadline
+    assert await entry_ends_at(store, access_jti, "mcp-jti-mappings") == pytest.approx(
+        deadline, abs=0.5
+    )
+    # No absolute refresh deadline anywhere: the refresh lifetime stays relative.
+    assert result.refresh_token is not None
+    refresh = proxy.jwt_issuer.verify_token(
+        result.refresh_token, expected_token_use="refresh"
+    )
+    assert refresh["exp"] - refresh["iat"] == 3_600
+
+
+async def test_a_legacy_code_is_bounded_by_the_earlier_relative_lifetime(proxy):
+    client = await register(proxy)
+    before = time.time()
+    result = await redeem(
+        proxy,
+        client,
+        {
+            "access_token": "valid-upstream",
+            "expires_in": 300,
+            "expires_at": int(before * 1_000),
+            "token_type": "Bearer",
+        },
+    )
+    assert result.expires_in is not None
+    assert result.expires_in <= 300
+    assert proxy.jwt_issuer.verify_token(result.access_token)["exp"] <= before + 301
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("expires_at", "soon"),
+        ("expires_at", True),
+        ("refresh_token_expires_at", "soon"),
+    ],
+)
+async def test_a_legacy_code_with_an_invalid_deadline_is_refused(
+    proxy, store, field, value
+):
+    client = await register(proxy)
+    tokens = {
+        "access_token": "valid-upstream",
+        "refresh_token": "upstream-refresh",
+        "expires_in": 300,
+        "refresh_expires_in": 3_600,
+        field: value,
+    }
+    with pytest.raises(TokenError) as refused:
+        await redeem(proxy, client, tokens)
+    assert refused.value.error == "invalid_grant"
+    assert await published(store) == NOTHING_PUBLISHED
+
+
+async def test_a_legacy_code_caps_the_refresh_fallback_at_its_refresh_deadline(
+    configured, store
+):
+    client = await register(configured)
+    refresh_deadline = time.time() + 1_800.5
+    result = await redeem(
+        configured,
+        client,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+            "refresh_token_expires_at": refresh_deadline,
+            "token_type": "Bearer",
+        },
+    )
+    assert result.refresh_token is not None
+    refresh = configured.jwt_issuer.verify_token(
+        result.refresh_token, expected_token_use="refresh"
+    )
+    assert refresh["exp"] == math.floor(refresh_deadline)
+    assert await entry_ends_at(
+        store, refresh["jti"], "mcp-jti-mappings"
+    ) == pytest.approx(refresh_deadline, abs=0.5)
+    metadata = await configured._refresh_token_store.get(
+        key=_hash_token(result.refresh_token)
+    )
+    assert metadata is not None
+    assert metadata.expires_at == math.floor(refresh_deadline)
+
+
+async def test_a_delayed_legacy_code_counts_its_relative_bound_from_creation(proxy):
+    client = await register(proxy)
+    created_at = time.time() - DELAY  # the code was created DELAY seconds ago
+    result = await redeem(
+        proxy,
+        client,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+            "expires_at": int(time.time()) + 1_000,
+            "refresh_expires_in": 3_600,
+            "refresh_token_expires_at": int(time.time()) + 100_000,
+        },
+        created_at=created_at,
+    )
+    # Counted from redemption these would be 300 s and 3600 s.
+    access = proxy.jwt_issuer.verify_token(result.access_token)
+    assert access["exp"] == math.floor(created_at + 300)
+    assert result.expires_in is not None
+    assert result.expires_in <= 300 - DELAY
+    _, token_set = await stored_set(proxy, result.access_token)
+    assert token_set.expires_at == created_at + 300
+    assert token_set.refresh_token_expires_at == created_at + 3_600
+    assert result.refresh_token is not None
+    refresh = proxy.jwt_issuer.verify_token(
+        result.refresh_token, expected_token_use="refresh"
+    )
+    assert refresh["exp"] == math.floor(created_at + 3_600)
+
+
+async def test_a_delayed_relative_only_legacy_code_is_unchanged(proxy):
+    client = await register(proxy)
+    result = await redeem(
+        proxy,
+        client,
+        {"access_token": "valid-upstream", "expires_in": 300},
+        created_at=time.time() - DELAY,
+    )
+    access = proxy.jwt_issuer.verify_token(result.access_token)
+    assert result.expires_in == 300
+    assert access["exp"] - access["iat"] == 300
+
+
+@pytest.mark.parametrize("absolute", [True, False])
+async def test_a_null_expires_in_is_absent_from_callback_to_redemption(proxy, absolute):
+    client = await register(proxy)
+    deadline = int(time.time()) + 200
+    response = {"access_token": "valid-upstream", "expires_in": None}
+    if absolute:
+        response["expires_at"] = deadline
+    code, stored = await recorded_code(proxy, response)
+    absent = dict(response)
+    del absent["expires_in"]
+    _, stored_absent = await recorded_code(proxy, absent)
+    assert stored.access_token_expires_at == stored_absent.access_token_expires_at
+
+    result = await exchange(proxy, client, code)
+
+    access = proxy.jwt_issuer.verify_token(result.access_token)
+    if absolute:
+        assert access["exp"] == deadline
+        assert result.expires_in is not None
+        assert result.expires_in <= 200
+    else:
+        # The relative fallback for a response without expires_in.
+        assert result.expires_in is not None
+        assert access["exp"] - access["iat"] == result.expires_in
+        assert result.expires_in > 300
+
+
+@pytest.mark.parametrize("absolute", [True, False])
+async def test_a_null_refresh_expires_in_is_absent_from_callback_to_redemption(
+    configured, store, absolute
+):
+    client = await register(configured)
+    refresh_deadline = time.time() + 1_800.5
+    response = {
+        "access_token": "valid-upstream",
+        "refresh_token": "upstream-refresh",
+        "expires_in": 300,
+        "refresh_expires_in": None,
+    }
+    if absolute:
+        response["refresh_token_expires_at"] = refresh_deadline
+    code, stored = await recorded_code(configured, response)
+    assert stored.refresh_token_expires_at == (refresh_deadline if absolute else None)
+
+    result = await exchange(configured, client, code)
+
+    assert result.refresh_token is not None
+    refresh = configured.jwt_issuer.verify_token(
+        result.refresh_token, expected_token_use="refresh"
+    )
+    metadata = await configured._refresh_token_store.get(
+        key=_hash_token(result.refresh_token)
+    )
+    assert metadata is not None
+    if absolute:
+        assert refresh["exp"] == math.floor(refresh_deadline)
+        assert metadata.expires_at == math.floor(refresh_deadline)
+        assert await entry_ends_at(
+            store, refresh["jti"], "mcp-jti-mappings"
+        ) == pytest.approx(refresh_deadline, abs=0.5)
+    else:
+        assert refresh["exp"] - refresh["iat"] == CONFIGURED_REFRESH_FALLBACK
+
+
+async def test_without_any_absolute_deadline_redemption_is_unchanged(proxy):
     client = await register(proxy)
     result = await redeem(
         proxy,
@@ -644,12 +882,10 @@ async def test_without_recorded_deadlines_redemption_is_unchanged(proxy):
             "access_token": "valid-upstream",
             "refresh_token": "upstream-refresh",
             "expires_in": 300,
-            "expires_at": int(time.time()) + 100,
             "refresh_expires_in": 3_600,
             "token_type": "Bearer",
         },
     )
-    # A legacy code: the raw response is not re-read at redemption.
     access = proxy.jwt_issuer.verify_token(result.access_token)
     assert result.expires_in == 300
     assert access["exp"] - access["iat"] == 300
@@ -658,6 +894,142 @@ async def test_without_recorded_deadlines_redemption_is_unchanged(proxy):
         result.refresh_token, expected_token_use="refresh"
     )
     assert refresh["exp"] - refresh["iat"] == 3_600
+
+
+# --------------------------------------------------------------------------
+# Configured lifetimes are capped by absolute deadlines
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+async def test_a_configured_access_lifetime_is_capped_on_redemption(
+    configured, store, recorded
+):
+    client = await register(configured)
+    deadline = int(time.time()) + 100
+    tokens = {
+        "access_token": "valid-upstream",
+        "refresh_token": "upstream-refresh",
+        "expires_in": 300,
+        "expires_at": deadline,
+        "refresh_expires_in": 3_600,
+    }
+    result = await redeem(
+        configured,
+        client,
+        tokens,
+        access_token_expires_at=deadline if recorded else None,
+        refresh_token_expires_at=time.time() + 3_600 if recorded else None,
+    )
+    assert result.expires_in is not None
+    assert result.expires_in <= 100
+    assert configured.jwt_issuer.verify_token(result.access_token)["exp"] == deadline
+    access_jti, token_set = await stored_set(configured, result.access_token)
+    assert token_set.expires_at == deadline
+    assert await entry_ends_at(store, access_jti, "mcp-jti-mappings") == pytest.approx(
+        deadline, abs=0.5
+    )
+    # The refresh lifetime is not clamped to the access deadline.
+    assert token_set.refresh_token_expires_at is not None
+    assert token_set.refresh_token_expires_at >= time.time() + 3_500
+
+
+async def test_a_delayed_code_with_configured_lifetimes_ends_at_its_deadlines(
+    configured, store, monkeypatch
+):
+    """Callback, then a redemption DELAY seconds later, through the real flow."""
+    client = await register(configured)
+    received = time.time()
+    access_deadline = int(received) + 300
+    code, stored = await recorded_code(
+        configured,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+            "expires_at": access_deadline,
+            "refresh_expires_in": 3_600,
+            "token_type": "Bearer",
+        },
+    )
+    refresh_deadline = stored.refresh_token_expires_at
+    assert refresh_deadline is not None
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + DELAY)
+    result = await exchange(configured, client, code)
+
+    # Access: the configured 3600 s is a maximum, capped at the upstream deadline.
+    access = configured.jwt_issuer.verify_token(result.access_token)
+    assert access["exp"] == access_deadline
+    assert result.expires_in is not None
+    assert result.expires_in <= 300 - DELAY
+    access_jti, token_set = await stored_set(configured, result.access_token)
+    assert token_set.expires_at == access_deadline
+    assert await entry_ends_at(store, access_jti, "mcp-jti-mappings") == pytest.approx(
+        access_deadline, abs=0.5
+    )
+    # Refresh: the recorded deadline, neither re-based nor clamped to 300 s.
+    assert token_set.refresh_token_expires_at == refresh_deadline
+    assert result.refresh_token is not None
+    refresh = configured.jwt_issuer.verify_token(
+        result.refresh_token, expected_token_use="refresh"
+    )
+    assert refresh["exp"] == math.floor(refresh_deadline)
+    assert await entry_ends_at(
+        store, refresh["jti"], "mcp-jti-mappings"
+    ) == pytest.approx(refresh_deadline, abs=0.5)
+    metadata = await configured._refresh_token_store.get(
+        key=_hash_token(result.refresh_token)
+    )
+    assert metadata is not None
+    assert metadata.expires_at == math.floor(refresh_deadline)
+    assert await entry_ends_at(
+        store, token_set.upstream_token_id, "mcp-upstream-tokens"
+    ) == pytest.approx(refresh_deadline, abs=0.5)
+
+
+async def test_a_configured_recorded_refresh_deadline_beats_the_fallback(
+    configured, store
+):
+    client = await register(configured)
+    refresh_deadline = time.time() + 600.5
+    result = await redeem(
+        configured,
+        client,
+        {"access_token": "valid-upstream", "refresh_token": "upstream-refresh"},
+        refresh_token_expires_at=refresh_deadline,
+    )
+    assert result.refresh_token is not None
+    refresh = configured.jwt_issuer.verify_token(
+        result.refresh_token, expected_token_use="refresh"
+    )
+    assert refresh["exp"] == math.floor(refresh_deadline)
+    assert await entry_ends_at(
+        store, refresh["jti"], "mcp-jti-mappings"
+    ) == pytest.approx(refresh_deadline, abs=0.5)
+
+
+async def test_without_any_absolute_deadline_configured_lifetimes_are_unchanged(
+    configured,
+):
+    client = await register(configured)
+    result = await redeem(
+        configured,
+        client,
+        {
+            "access_token": "valid-upstream",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 300,
+        },
+    )
+    access = configured.jwt_issuer.verify_token(result.access_token)
+    assert result.expires_in == CONFIGURED_ACCESS
+    assert access["exp"] - access["iat"] == CONFIGURED_ACCESS
+    assert result.refresh_token is not None
+    refresh = configured.jwt_issuer.verify_token(
+        result.refresh_token, expected_token_use="refresh"
+    )
+    assert refresh["exp"] - refresh["iat"] == CONFIGURED_REFRESH_FALLBACK
 
 
 # --------------------------------------------------------------------------
@@ -786,6 +1158,180 @@ async def test_a_downstream_refresh_takes_the_earlier_refresh_deadline(
     assert rotated["exp"] == math.floor(deadline)
 
 
+async def test_a_downstream_refresh_caps_the_configured_access_lifetime(
+    configured, store
+):
+    client, result = await signed_in(configured)
+    deadline = int(time.time()) + 100
+    new_refresh_deadline = int(time.time()) + 7_200
+    response = refresh_response(deadline, refresh_token_expires_at=new_refresh_deadline)
+    response["refresh_expires_in"] = 9_000
+    refreshed = await refresh(configured, client, result, response)
+
+    access = configured.jwt_issuer.verify_token(refreshed.access_token)
+    assert access["exp"] == deadline
+    assert refreshed.expires_in is not None
+    assert refreshed.expires_in <= 100
+    access_jti, token_set = await stored_set(configured, refreshed.access_token)
+    assert token_set.expires_at == deadline
+    assert await entry_ends_at(store, access_jti, "mcp-jti-mappings") == pytest.approx(
+        deadline, abs=0.5
+    )
+    # The fresh response's refresh deadline advances the recorded one.
+    assert token_set.refresh_token_expires_at == new_refresh_deadline
+    assert refreshed.refresh_token is not None
+    rotated = configured.jwt_issuer.verify_token(
+        refreshed.refresh_token, expected_token_use="refresh"
+    )
+    assert rotated["exp"] == new_refresh_deadline
+    assert await entry_ends_at(
+        store, rotated["jti"], "mcp-jti-mappings"
+    ) == pytest.approx(new_refresh_deadline, abs=0.5)
+    metadata = await configured._refresh_token_store.get(
+        key=_hash_token(refreshed.refresh_token)
+    )
+    assert metadata is not None
+    assert metadata.expires_at == new_refresh_deadline
+
+
+async def test_a_downstream_refresh_without_deadlines_keeps_configured_lifetimes(
+    configured,
+):
+    client = await register(configured)
+    result = await redeem(
+        configured,
+        client,
+        {"access_token": "valid-upstream", "refresh_token": "upstream-refresh"},
+    )
+    response = refresh_response(rotate=False)
+    refreshed = await refresh(configured, client, result, response)
+
+    access = configured.jwt_issuer.verify_token(refreshed.access_token)
+    assert refreshed.expires_in == CONFIGURED_ACCESS
+    assert access["exp"] - access["iat"] == CONFIGURED_ACCESS
+
+
+# --------------------------------------------------------------------------
+# A slow upstream-claims hook never restarts the clock
+# --------------------------------------------------------------------------
+
+SHORT_CONFIGURED_ACCESS = 60
+
+
+@pytest.fixture
+def short_configured(verifier, store) -> OAuthProxy:
+    return make_proxy(
+        verifier, store, fastmcp_access_token_expiry_seconds=SHORT_CONFIGURED_ACCESS
+    )
+
+
+def slow_claims_hook(proxy: OAuthProxy, monkeypatch, seconds: float) -> None:
+    """Make the upstream-claims hook take `seconds` of (patched) wall time."""
+    real_time = time.time
+    offset = [0.0]
+    monkeypatch.setattr(time, "time", lambda: real_time() + offset[0])
+
+    async def extract(_token_data):
+        offset[0] += seconds
+
+    monkeypatch.setattr(proxy, "_extract_upstream_claims", extract)
+
+
+async def test_a_slow_hook_keeps_the_configured_redemption_expiry_fixed(
+    short_configured, store, monkeypatch
+):
+    client = await register(short_configured)
+    start = time.time()
+    tokens = {"access_token": "valid-upstream", "refresh_token": "upstream-refresh"}
+    slow_claims_hook(short_configured, monkeypatch, 50)
+    result = await redeem(
+        short_configured,
+        client,
+        tokens,
+        access_token_expires_at=start + 100,
+        refresh_token_expires_at=start + 3_600,
+    )
+
+    # Fixed when calculated: start + 60, not hook end (start + 50) + 60.
+    exp = short_configured.jwt_issuer.verify_token(result.access_token)["exp"]
+    assert start + 59 <= exp <= start + SHORT_CONFIGURED_ACCESS
+    assert result.expires_in is not None
+    assert result.expires_in <= SHORT_CONFIGURED_ACCESS - 50
+    access_jti, token_set = await stored_set(short_configured, result.access_token)
+    assert token_set.expires_at == start + 100
+    assert await entry_ends_at(store, access_jti, "mcp-jti-mappings") == pytest.approx(
+        exp, abs=0.5
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured_access", "upstream_lifetime"),
+    [(True, 100), (False, 30)],
+    ids=["configured-maximum", "upstream-deadline"],
+)
+async def test_a_slow_hook_crossing_the_redemption_expiry_is_refused(
+    verifier, store, monkeypatch, configured_access, upstream_lifetime
+):
+    config = (
+        {"fastmcp_access_token_expiry_seconds": SHORT_CONFIGURED_ACCESS}
+        if configured_access
+        else {}
+    )
+    proxy = make_proxy(verifier, store, **config)
+    client = await register(proxy)
+    start = time.time()
+    slow_claims_hook(proxy, monkeypatch, 70)
+    with pytest.raises(TokenError) as refused:
+        await redeem(
+            proxy,
+            client,
+            {"access_token": "valid-upstream", "refresh_token": "upstream-refresh"},
+            access_token_expires_at=start + upstream_lifetime,
+            refresh_token_expires_at=start + 3_600,
+        )
+    assert refused.value.error == "invalid_grant"
+    assert await store.keys("mcp-jti-mappings") == []
+    assert await store.keys("mcp-refresh-tokens") == []
+
+
+async def test_a_slow_hook_keeps_the_configured_refresh_expiry_fixed(
+    short_configured, store, monkeypatch
+):
+    client, result = await signed_in(short_configured)
+    start = time.time()
+    slow_claims_hook(short_configured, monkeypatch, 50)
+    refreshed = await refresh(
+        short_configured, client, result, refresh_response(int(start) + 100)
+    )
+
+    exp = short_configured.jwt_issuer.verify_token(refreshed.access_token)["exp"]
+    assert start + 59 <= exp <= start + SHORT_CONFIGURED_ACCESS
+    assert refreshed.expires_in is not None
+    assert refreshed.expires_in <= SHORT_CONFIGURED_ACCESS - 50
+    access_jti, token_set = await stored_set(short_configured, refreshed.access_token)
+    assert token_set.expires_at == int(start) + 100
+    assert await entry_ends_at(store, access_jti, "mcp-jti-mappings") == pytest.approx(
+        exp, abs=0.5
+    )
+
+
+async def test_a_slow_hook_crossing_the_refresh_expiry_is_refused(
+    short_configured, store, monkeypatch
+):
+    client, result = await signed_in(short_configured)
+    assert result.refresh_token is not None
+    old_metadata_key = _hash_token(result.refresh_token)
+    start = time.time()
+    slow_claims_hook(short_configured, monkeypatch, 70)
+    with pytest.raises(TokenError) as refused:
+        await refresh(
+            short_configured, client, result, refresh_response(int(start) + 100)
+        )
+    assert refused.value.error == "invalid_grant"
+    # The refused rotation published no new refresh token; the old one stays.
+    assert await store.keys("mcp-refresh-tokens") == [old_metadata_key]
+
+
 async def test_a_downstream_refresh_keeps_the_recorded_refresh_deadline(proxy):
     refresh_deadline = time.time() + 1_800.5
     client, result = await signed_in(proxy, refresh_deadline=refresh_deadline)
@@ -862,6 +1408,7 @@ async def test_a_downstream_refresh_past_the_recorded_refresh_deadline_is_refuse
 
 
 async def expired_session(proxy: OAuthProxy) -> str:
+    """A session whose access token expired; its refresh deadline is authoritative."""
     await proxy._upstream_token_store.put(
         key="upstream-id",
         value=UpstreamTokenSet(
@@ -869,6 +1416,7 @@ async def expired_session(proxy: OAuthProxy) -> str:
             access_token="expired-upstream",
             refresh_token="upstream-refresh",
             refresh_token_expires_at=time.time() + 3_600,
+            refresh_token_expires_at_authoritative=True,
             expires_at=time.time() - 60,
             token_type="Bearer",
             scope="read",
@@ -933,6 +1481,38 @@ async def test_a_transparent_refresh_bounds_a_malformed_expires_at(proxy):
     assert token_set.refresh_token_expires_at == before + 900
 
 
+LONG_CONFIGURED_ACCESS = 30 * 86_400
+
+
+async def test_a_transparent_refresh_does_not_extend_retention_by_configuration(
+    verifier, store
+):
+    proxy = make_proxy(
+        verifier, store, fastmcp_access_token_expiry_seconds=LONG_CONFIGURED_ACCESS
+    )
+    token = await expired_session(proxy)
+    before = await proxy._upstream_token_store.get(key="upstream-id")
+    assert before is not None
+    refresh_deadline = before.refresh_token_expires_at
+    assert refresh_deadline is not None
+    deadline = int(time.time()) + 100
+    validated = await transparently_refresh(
+        proxy, token, refresh_response(deadline, rotate=False)
+    )
+
+    assert validated is not None
+    token_set = await proxy._upstream_token_store.get(key="upstream-id")
+    assert token_set is not None
+    assert token_set.expires_at == deadline
+    assert token_set.refresh_token_expires_at == refresh_deadline
+    retained_until = await entry_ends_at(store, "upstream-id", "mcp-upstream-tokens")
+    # Retained for the refresh token on its own, well past the short access
+    # deadline, and not extended to the 30-day configured access lifetime.
+    assert retained_until == pytest.approx(refresh_deadline, abs=1)
+    assert retained_until > deadline + 3_000
+    assert retained_until < time.time() + LONG_CONFIGURED_ACCESS / 2
+
+
 @pytest.mark.parametrize("expires_at", ["past", True, math.inf])
 async def test_a_transparent_refresh_with_a_bad_deadline_stores_nothing(
     proxy, expires_at
@@ -945,3 +1525,281 @@ async def test_a_transparent_refresh_with_a_bad_deadline_stores_nothing(
         await transparently_refresh(proxy, token, refresh_response(expires_at)) is None
     )
     assert await proxy._upstream_token_store.get(key="upstream-id") == before
+
+
+# --------------------------------------------------------------------------
+# Retention for outstanding access tokens
+# --------------------------------------------------------------------------
+
+RETENTION_CONFIG = {
+    "fastmcp_access_token_expiry_seconds": 3_600,
+    "fallback_access_token_expiry_seconds": 60,
+    "fallback_refresh_token_expiry_seconds": 600,
+}
+
+
+class Clock:
+    """A patched clock the test advances, shared by the proxy and MemoryStore.
+
+    py-key-value stamps and expires entries with its own `datetime.now`, so it
+    is patched too: entries then really expire at the patched time.
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        self.start = time.time()
+        self.offset = 0.0
+        real_time = time.time
+        monkeypatch.setattr(time, "time", lambda: real_time() + self.offset)
+
+        def now() -> datetime:
+            return datetime.fromtimestamp(time.time(), tz=timezone.utc)
+
+        def now_plus(seconds: float) -> datetime:
+            return now() + timedelta(seconds=seconds)
+
+        for module in (time_to_live, managed_entry):
+            monkeypatch.setattr(module, "now", now)
+            monkeypatch.setattr(module, "now_plus", now_plus)
+
+
+def upstream_rejects(verifier, rejected: set[str]) -> None:
+    """Make the verifier reject the upstream access tokens in `rejected`."""
+
+    async def verify(token: str) -> AccessToken | None:
+        if token in rejected:
+            return None
+        return AccessToken(token=token, client_id="test-client", scopes=["read"])
+
+    verifier.verify_token.side_effect = verify
+
+
+def refreshed_upstream(token: str, expires_at: int) -> dict:
+    """A refresh response with an access deadline and no refresh expiry."""
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": 60,
+        "expires_at": expires_at,
+    }
+
+
+async def relative_session(proxy: OAuthProxy, client, response: dict):
+    """Redeem a code from a real callback for `response`."""
+    code, _ = await recorded_code(proxy, response)
+    result = await exchange(proxy, client, code)
+    access_jti, token_set = await stored_set(proxy, result.access_token)
+    return result, access_jti, token_set
+
+
+async def test_a_transparent_refresh_keeps_the_record_for_outstanding_tokens(
+    verifier, store, monkeypatch
+):
+    """Fauna's scenario: a synthetic refresh expiry must not drop the record."""
+    proxy = make_proxy(verifier, store, **RETENTION_CONFIG)
+    client = await register(proxy)
+    clock = Clock(monkeypatch)
+    t = clock.start
+    rejected = {"stale-upstream"}
+    upstream_rejects(verifier, rejected)
+    result, access_jti, token_set = await relative_session(
+        proxy,
+        client,
+        {"access_token": "stale-upstream", "refresh_token": "upstream-refresh"},
+    )
+    # Relative issuance: a 3600 s access JWT and JTI, a synthetic refresh expiry.
+    access = proxy.jwt_issuer.verify_token(result.access_token)
+    assert access["exp"] - access["iat"] == 3_600
+    assert token_set.refresh_token_expires_at == pytest.approx(t + 600, abs=1)
+    assert not token_set.refresh_token_expires_at_authoritative
+    jti_ends = await entry_ends_at(store, access_jti, "mcp-jti-mappings")
+
+    upstream = AsyncMock()
+    upstream.refresh_token = AsyncMock(
+        side_effect=[
+            refreshed_upstream("refreshed-upstream", int(t) + 121),
+            refreshed_upstream("refreshed-upstream-2", int(t) + 661),
+        ]
+    )
+    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
+        clock.offset = 61
+        assert await proxy.load_access_token(result.access_token) is not None
+        retained = await entry_ends_at(
+            store, token_set.upstream_token_id, "mcp-upstream-tokens"
+        )
+        # The record outlives the outstanding JWT/JTI, not the synthetic t+600.
+        assert retained >= jti_ends - 1
+
+        # A request at t+601 still loads and refreshes with the refresh token.
+        clock.offset = 601
+        rejected.add("refreshed-upstream")
+        validated = await proxy.load_access_token(result.access_token)
+    assert validated is not None
+    assert validated.token == "refreshed-upstream-2"
+    assert upstream.refresh_token.call_count == 2
+
+
+async def test_a_downstream_refresh_keeps_the_record_for_outstanding_tokens(
+    verifier, store, monkeypatch
+):
+    proxy = make_proxy(verifier, store, **RETENTION_CONFIG)
+    client = await register(proxy)
+    clock = Clock(monkeypatch)
+    result, access_jti, token_set = await relative_session(
+        proxy,
+        client,
+        {"access_token": "valid-upstream", "refresh_token": "upstream-refresh"},
+    )
+    jti_ends = await entry_ends_at(store, access_jti, "mcp-jti-mappings")
+
+    clock.offset = 61
+    response = refreshed_upstream("refreshed-upstream", int(clock.start) + 121)
+    await refresh(proxy, client, result, response)
+
+    # The first access JWT (3600 s, relative) still references the record.
+    retained = await entry_ends_at(
+        store, token_set.upstream_token_id, "mcp-upstream-tokens"
+    )
+    assert retained >= jti_ends - 1
+
+
+async def test_a_transparent_refresh_ends_retention_at_an_authoritative_deadline(
+    verifier, store, monkeypatch
+):
+    proxy = make_proxy(verifier, store, **RETENTION_CONFIG)
+    client = await register(proxy)
+    clock = Clock(monkeypatch)
+    upstream_rejects(verifier, {"stale-upstream"})
+    result, access_jti, token_set = await relative_session(
+        proxy,
+        client,
+        {
+            "access_token": "stale-upstream",
+            "refresh_token": "upstream-refresh",
+            "refresh_expires_in": 600,
+        },
+    )
+    refresh_deadline = token_set.refresh_token_expires_at
+    assert refresh_deadline is not None
+    assert token_set.refresh_token_expires_at_authoritative
+    jti_ends = await entry_ends_at(store, access_jti, "mcp-jti-mappings")
+
+    upstream = AsyncMock()
+    upstream.refresh_token = AsyncMock(
+        side_effect=[
+            refreshed_upstream("refreshed-upstream", int(clock.start) + 121),
+            refreshed_upstream("refreshed-upstream-2", int(clock.start) + 661),
+        ]
+    )
+    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
+        clock.offset = 61
+        assert await proxy.load_access_token(result.access_token) is not None
+        retained = await entry_ends_at(
+            store, token_set.upstream_token_id, "mcp-upstream-tokens"
+        )
+        # Past the authoritative refresh deadline the record serves no token.
+        assert retained == pytest.approx(refresh_deadline, abs=1)
+        assert retained < jti_ends - 2_000
+
+        # At t+601 the JWT and its JTI are still valid, but the real refresh
+        # authority is gone: the request fails closed, with no upstream refresh.
+        clock.offset = 601
+        assert await proxy._jti_mapping_store.get(key=access_jti) is not None
+        assert await proxy.load_access_token(result.access_token) is None
+    assert upstream.refresh_token.call_count == 1
+
+
+async def legacy_session(proxy: OAuthProxy, store: MemoryStore, t: float) -> str:
+    """An upstream record serialized before refresh-expiry provenance existed.
+
+    Written as a raw dict through the store, read back by the real model
+    adapter: it has a stored refresh expiry (t+600) but no provenance field.
+    Returns a FastMCP access token (3600 s) that references it.
+    """
+    await store.put(
+        "legacy-id",
+        {
+            "upstream_token_id": "legacy-id",
+            "access_token": "stale-upstream",
+            "refresh_token": "upstream-refresh",
+            "refresh_token_expires_at": t + 600,
+            "expires_at": t + 60,
+            "token_type": "Bearer",
+            "scope": "read",
+            "client_id": "test-client",
+            "created_at": t,
+            "raw_token_data": {},
+        },
+        collection="mcp-upstream-tokens",
+        ttl=3_600,
+    )
+    for jti in ("legacy-access", "legacy-refresh"):
+        await store.put(
+            jti,
+            {"jti": jti, "upstream_token_id": "legacy-id", "created_at": t},
+            collection="mcp-jti-mappings",
+            ttl=3_600,
+        )
+    loaded = await proxy._upstream_token_store.get(key="legacy-id")
+    assert loaded is not None
+    assert loaded.refresh_token_expires_at_authoritative  # unknown: a hard bound
+    return proxy.jwt_issuer.issue_access_token(
+        client_id="test-client", scopes=["read"], jti="legacy-access", expires_in=3_600
+    )
+
+
+async def test_a_legacy_record_bounds_retention_on_transparent_refresh(
+    verifier, store, monkeypatch
+):
+    proxy = make_proxy(verifier, store, **RETENTION_CONFIG)
+    clock = Clock(monkeypatch)
+    t = clock.start
+    upstream_rejects(verifier, {"stale-upstream"})
+    token = await legacy_session(proxy, store, t)
+
+    clock.offset = 61
+    validated = await transparently_refresh(
+        proxy, token, refreshed_upstream("refreshed-upstream", int(t) + 121)
+    )
+
+    assert validated is not None
+    retained = await entry_ends_at(store, "legacy-id", "mcp-upstream-tokens")
+    # Never past max(real access deadline, stored refresh deadline).
+    assert retained <= max(int(t) + 121, t + 600) + 0.5
+    assert retained == pytest.approx(t + 600, abs=1)
+
+
+async def test_a_legacy_record_bounds_retention_on_downstream_refresh(
+    verifier, store, monkeypatch
+):
+    proxy = make_proxy(verifier, store, **RETENTION_CONFIG)
+    client = await register(proxy)
+    clock = Clock(monkeypatch)
+    t = clock.start
+    await legacy_session(proxy, store, t)
+    refresh_token = proxy.jwt_issuer.issue_refresh_token(
+        client_id="test-client", scopes=["read"], jti="legacy-refresh", expires_in=600
+    )
+
+    clock.offset = 61
+    upstream = AsyncMock()
+    upstream.refresh_token = AsyncMock(
+        return_value=refreshed_upstream("refreshed-upstream", int(t) + 121)
+    )
+    with patch.object(proxy, "_create_upstream_oauth_client", return_value=upstream):
+        refreshed = await proxy.exchange_refresh_token(
+            client=client,
+            refresh_token=RefreshToken(
+                token=refresh_token, client_id="test-client", scopes=["read"]
+            ),
+            scopes=["read"],
+        )
+
+    retained = await entry_ends_at(store, "legacy-id", "mcp-upstream-tokens")
+    assert retained <= max(int(t) + 121, t + 600) + 0.5
+    assert retained == pytest.approx(t + 600, abs=1)
+    # The rotated refresh token ends at the stored refresh deadline too.
+    assert refreshed.refresh_token is not None
+    rotated = proxy.jwt_issuer.verify_token(
+        refreshed.refresh_token, expected_token_use="refresh"
+    )
+    assert rotated["exp"] == math.floor(t + 600)

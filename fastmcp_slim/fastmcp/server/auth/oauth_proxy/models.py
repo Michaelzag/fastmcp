@@ -76,10 +76,15 @@ class ClientCode(BaseModel):
     scopes: list[str]
     idp_tokens: dict[str, Any]
     expires_at: float
+    # When the code was created, after the upstream token fetch; not the exact
+    # token receipt time.
     created_at: float
     # Absolute upstream deadlines (Unix seconds), normalized when the callback
     # received the token response. None when the response gave none or the code
-    # predates these fields; redemption then keeps the relative fallback.
+    # predates these fields. For a code predating them, redemption still honours
+    # an absolute deadline in idp_tokens (bounded by the relative lifetime counted
+    # from created_at); only with no absolute deadline anywhere does it keep the
+    # relative fallback.
     access_token_expires_at: float | None = None
     refresh_token_expires_at: float | None = None
 
@@ -99,6 +104,18 @@ class UpstreamTokenSet(BaseModel):
         float | None
     )  # Unix timestamp when refresh token expires (if known)
     expires_at: float  # Unix timestamp when access token expires
+    # True when refresh_token_expires_at is upstream authority: a response's
+    # refresh_token_expires_at, or an upstream refresh_expires_in anchored once
+    # (at receipt, or at redemption for a code predating recorded deadlines).
+    # False only for a locally synthesized fallback expiry, which every writer
+    # sets explicitly. A record predating this field has unknown provenance and
+    # is conservatively read as True: its stored expiry is honoured as a hard
+    # bound (this is an interpretation, not reconstructed provenance), so a
+    # legacy record holding a synthetic fallback may need an earlier re-auth.
+    # A later response without a refresh expiry keeps both values. Only an
+    # authoritative deadline may end retention before outstanding FastMCP
+    # access tokens that reference this record.
+    refresh_token_expires_at_authoritative: bool = True
     token_type: str  # Usually "Bearer"
     scope: str  # Space-separated scopes
     client_id: str  # MCP client this is bound to
